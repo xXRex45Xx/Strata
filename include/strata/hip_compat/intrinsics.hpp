@@ -1,11 +1,19 @@
 #pragma once
 
-// CUDA device intrinsics used by Strata kernels on supported wave32 HIP targets.
+// CUDA device intrinsics used by Strata kernels on supported wave32 HIP targets, and (STRATA_HIP_WAVE64) on the wave64
+// gfx906 / gfx908, where a CUDA warp is a logical 32-lane half of the 64-lane wavefront: every shuffle keeps width 32,
+// __ballot_sync returns the caller's own half, so each kernel's lane mapping and reduction order stay as on wave32.
 // This header is included only from the HIP cuda_runtime compatibility shim.
 #if defined(__HIPCC__)
 #include <hip/hip_version.h>
 
 #include <cstdint>
+
+#if defined(STRATA_HIP_WAVE64) && defined(__gfx906__)
+// The gfx906 device pass of a mixed wave64 build: kernel bodies take the STRATA_HIP_GFX906 build's in-thread gfx906 code
+// (`#if defined(STRATA_HIP_GFX906) || defined(STRATA_GFX906_DEVICE_PASS)`) where it leaves the launch shape alone.
+#define STRATA_GFX906_DEVICE_PASS 1
+#endif
 
 namespace strata::hip_compat {
 
@@ -26,6 +34,9 @@ __device__ __forceinline__ int dp4a(int a, int b, int c) {
 #elif (defined(__gfx1030__) || defined(__gfx1031__) || defined(__gfx1032__)) && __has_builtin(__builtin_amdgcn_sdot4)
     // RDNA2 has no sudot4 (that is gfx11+), but it has the plain signed v_dot4_i32_i8 (dot1-insts): the same
     // signed x signed byte products accumulated modulo 2^32, no clamp.
+    return __builtin_amdgcn_sdot4(a, b, c, false);
+#elif (defined(__gfx906__) || defined(__gfx908__)) && __has_builtin(__builtin_amdgcn_sdot4)
+    // Vega 20 (gfx906: MI50 / MI60, Radeon VII) and CDNA1 (gfx908: MI100): v_dot4_i32_i8, as on RDNA2.
     return __builtin_amdgcn_sdot4(a, b, c, false);
 #elif defined(__gfx1012__) && !defined(STRATA_GFX1012_PORTABLE_DOT)
     // RDNA1 has no native signed dot4. SDWA selects and sign-extends byte
@@ -97,13 +108,24 @@ __device__ __forceinline__ int vcmpne4(int a, int b) {
 
 // CUDA's mask argument describes participating lanes. The current kernel set uses full
 // wave32 masks; reject future partial-mask use instead of silently dropping its semantics.
+// (On wave64 the kernels still pass 0xffffffff: the half-wavefront mapping reads it per 32-lane half.)
 __device__ __forceinline__ void require_full_wave_mask(uint32_t mask) {
     if (mask != 0xffffffffu) __builtin_trap();
 }
 
+#ifdef STRATA_HIP_WAVE64
+// __syncwarp in a wave64 build: HIP_DISABLE_WARP_SYNC_BUILTINS (cuda_runtime.h) removes HIP's own on every HIP version,
+// in every device pass. A wave barrier alone does not order memory; release/acquire fences at wavefront scope cover the
+// shared-memory exchange used by attention (the barrier is the whole wavefront either way, as in HIP 7's own form).
+__device__ __forceinline__ void syncwarp(uint32_t mask = 0xffffffffu) {
+    require_full_wave_mask(mask);
+    __builtin_amdgcn_fence(__ATOMIC_RELEASE, "wavefront");
+    __builtin_amdgcn_wave_barrier();
+    __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "wavefront");
+}
+#elif HIP_VERSION_MAJOR < 7
 // Older HIP has no __syncwarp. A wave barrier alone does not order memory.
 // Release/acquire fences cover the shared-memory exchange used by attention.
-#if HIP_VERSION_MAJOR < 7
 __device__ __forceinline__ void syncwarp(uint32_t mask = 0xffffffffu) {
     require_full_wave_mask(mask);
     __builtin_amdgcn_fence(__ATOMIC_RELEASE, "workgroup");
@@ -138,7 +160,13 @@ __device__ __forceinline__ T shfl_sync(uint32_t mask, T value, int source_lane, 
 
 __device__ __forceinline__ unsigned ballot_sync(uint32_t mask, int predicate) {
     require_full_wave_mask(mask);
+#ifdef STRATA_HIP_WAVE64
+    // __ballot returns the whole wavefront's mask; a CUDA warp is the caller's 32-lane half, so lanes 32..63 take the
+    // far half's bits. On a wave32 device pass of the same binary __lane_id() < 32, and this is the plain ballot.
+    return static_cast<unsigned>(__ballot(predicate) >> (__lane_id() & 32));
+#else
     return static_cast<unsigned>(__ballot(predicate));
+#endif
 }
 
 }  // namespace strata::hip_compat
@@ -153,11 +181,17 @@ __device__ __forceinline__ unsigned ballot_sync(uint32_t mask, int predicate) {
 #define __shfl_up_sync(...) (::strata::hip_compat::shfl_up_sync(__VA_ARGS__))
 #define __shfl_sync(...) (::strata::hip_compat::shfl_sync(__VA_ARGS__))
 #define __ballot_sync(mask, predicate) (::strata::hip_compat::ballot_sync((mask), (predicate)))
-#if HIP_VERSION_MAJOR < 7
+#if defined(STRATA_HIP_WAVE64) || HIP_VERSION_MAJOR < 7
 #define __syncwarp(...) (::strata::hip_compat::syncwarp(__VA_ARGS__))
 #endif
+#if defined(STRATA_HIP_WAVE64) && (defined(__gfx906__) || defined(__gfx908__))
+// gfx906 / gfx908 device pass: s_sleep counts 64 clocks per unit (~40 ns at 1.7 GHz); the spin loops only need "back
+// off a little", so a long requested wait takes a longer unit (as in the STRATA_HIP_GFX906 build).
+#define __nanosleep(ns) __builtin_amdgcn_s_sleep((ns) >= 400u ? 8u : 1u)
+#else
 // AMD's sleep instruction accepts only 0..15; the synchronization loops use it as a
 // backoff hint, so use its smallest portable delay independently of CUDA cycle counts.
 #define __nanosleep(cycles) __builtin_amdgcn_s_sleep(1)
+#endif
 
 #endif  // defined(__HIPCC__)

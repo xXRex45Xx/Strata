@@ -9,8 +9,20 @@
 #define NOMINMAX
 #endif
 #endif
+#ifdef STRATA_HIP_WAVE64
+// On wave64 cards (gfx906, gfx908) HIP's own warp-sync builtins would run across the whole 64-lane wavefront and break
+// every kernel's reduction order; disable them and let intrinsics.hpp supply the logical-32-lane-half mapping.
+// Must come before hip_runtime.h. Wave32-only builds leave HIP's builtins alone: they compile exactly as before.
+#ifndef HIP_DISABLE_WARP_SYNC_BUILTINS
+#define HIP_DISABLE_WARP_SYNC_BUILTINS 1
+#endif
+#endif  // STRATA_HIP_WAVE64
 #include <hip/hip_runtime.h>
 #include <hip/hip_version.h>
+#ifdef STRATA_HIP_WAVE64
+#include <atomic>
+#include "host_lock.hpp"
+#endif
 // Do not let HIP's legacy macro corrupt libstdc++ attribute names.
 #ifdef __noinline__
 #undef __noinline__
@@ -44,7 +56,9 @@
 #define cudaEventSynchronize hipEventSynchronize
 #define cudaEvent_t hipEvent_t
 #define cudaFree hipFree
-#if HIP_VERSION_MAJOR < 7
+#ifdef STRATA_HIP_WAVE64
+#define cudaFreeHost(p) (::strata::hip_compat::host_free(p))
+#elif HIP_VERSION_MAJOR < 7
 #define cudaFreeHost hipHostFree
 #else
 #define cudaFreeHost hipFreeHost
@@ -63,7 +77,52 @@
 #define cudaGraphLaunch hipGraphLaunch
 #define cudaGraphUpload hipGraphUpload
 #define cudaGraph_t hipGraph_t
+#ifdef STRATA_HIP_WAVE64
+// Mapped host memory is how the GPU and the CPU talk inside a running graph (the doorbells, the CPU experts' results,
+// the verify flags): a kernel spins on a word the CPU writes, and the CPU on a word the kernel writes. On gfx906 that
+// needs FINE-GRAINED (coherent) memory - coarse-grained host memory may sit in the GPU's L2 for the whole kernel and the
+// spin never sees the other side (the STRATA_HIP_GFX906 build makes every mapped allocation coherent for this reason).
+// The wave32 cards keep the plain hipHostMalloc (the Strix Halo / RDNA and APU paths depend on it), and a wave64 arch
+// beside wave32 ones (gfx906;gfx1200) is one binary, so this is decided per device at run time: a portable allocation
+// (any GPU may read it) is coherent when any visible GPU is wave64, any other one when the current GPU is.
+inline bool strata_hip_device_wave64(int dev) {
+    static std::atomic<int> cache[64]{};   // 0 not probed yet, 1 wave32, 2 wave64
+    if (dev < 0 || dev >= 64) return true;
+    int c = cache[dev].load(std::memory_order_relaxed);
+    if (!c) {
+        int ws = 64;
+        if (hipDeviceGetAttribute(&ws, hipDeviceAttributeWarpSize, dev) != hipSuccess) ws = 64;
+        c = ws == 64 ? 2 : 1;
+        cache[dev].store(c, std::memory_order_relaxed);
+    }
+    return c == 2;
+}
+inline bool strata_hip_any_wave64() {
+    static const bool any = [] {
+        int n = 0;
+        if (hipGetDeviceCount(&n) != hipSuccess) return true;
+        for (int d = 0; d < n; ++d)
+            if (strata_hip_device_wave64(d)) return true;
+        return false;
+    }();
+    return any;
+}
+inline hipError_t cudaHostAlloc(void** p, size_t bytes, unsigned int flags) {
+    if (flags & hipHostMallocMapped) {
+        int dev = 0;
+        const bool wave64 = (flags & hipHostMallocPortable) ? strata_hip_any_wave64()
+                            : hipGetDevice(&dev) != hipSuccess || strata_hip_device_wave64(dev);
+        if (wave64) flags |= hipHostMallocCoherent;
+    }
+    return ::strata::hip_compat::host_malloc(p, bytes, flags);
+}
+template <typename T>
+inline hipError_t cudaHostAlloc(T** p, size_t bytes, unsigned int flags) {
+    return cudaHostAlloc(reinterpret_cast<void**>(p), bytes, flags);
+}
+#else
 #define cudaHostAlloc hipHostMalloc
+#endif  // STRATA_HIP_WAVE64
 #if HIP_VERSION_MAJOR < 7
 #define cudaHostAllocDefault hipHostMallocDefault
 #define cudaHostAllocMapped hipHostMallocMapped
@@ -74,11 +133,19 @@
 #define cudaHostAllocPortable hipHostAllocPortable
 #endif
 #define cudaHostGetDevicePointer hipHostGetDevicePointer
+#ifdef STRATA_HIP_WAVE64
+#define cudaHostRegister(p, bytes, flags) (::strata::hip_compat::host_register((p), (bytes), (flags)))
+#else
 #define cudaHostRegister hipHostRegister
+#endif
 #define cudaHostRegisterMapped hipHostRegisterMapped
 #define cudaHostRegisterPortable hipHostRegisterPortable
 #define cudaHostRegisterReadOnly hipHostRegisterReadOnly
+#ifdef STRATA_HIP_WAVE64
+#define cudaHostUnregister(p) (::strata::hip_compat::host_unregister(p))
+#else
 #define cudaHostUnregister hipHostUnregister
+#endif
 #define cudaLaunchHostFunc hipLaunchHostFunc
 #define cudaMalloc hipMalloc
 #define cudaMallocHost(...) (::strata::hip_compat::malloc_host(__VA_ARGS__))
@@ -127,7 +194,11 @@ hipError_t mem_get_info(size_t* free_bytes, size_t* total_bytes);
 namespace strata::hip_compat {
 template <typename T>
 inline hipError_t malloc_host(T** pointer, size_t bytes) {
+#ifdef STRATA_HIP_WAVE64
+    return host_malloc(reinterpret_cast<void**>(pointer), bytes, hipHostMallocDefault);
+#else
     return hipHostMalloc(reinterpret_cast<void**>(pointer), bytes, hipHostMallocDefault);
+#endif
 }
 }  // namespace strata::hip_compat
 

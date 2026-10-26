@@ -58,9 +58,16 @@ std::string arch_problem(const cudaDeviceProp& p, int ordinal) {
                "); compile it for this card (./setup.sh --backend hip, or -DCMAKE_HIP_ARCHITECTURES=" + arch +
                ", docs/AMD_HIP.md) or choose another GPU with HIP_VISIBLE_DEVICES";
     }
+#if defined(STRATA_HIP_WAVE64)
+    // a wave64 build (gfx906 / gfx908 in the list) runs its wave64 cards through the half-wavefront compat layer
+    if (p.warpSize != 32 && p.warpSize != 64) {
+        return card + " runs wave" + std::to_string(p.warpSize) + "; Strata's HIP kernels need wave32 or wave64";
+    }
+#else
     if (p.warpSize != 32) {
         return card + " runs wave" + std::to_string(p.warpSize) + "; Strata's HIP kernels need wave32";
     }
+#endif
     return "";
 }
 #endif
