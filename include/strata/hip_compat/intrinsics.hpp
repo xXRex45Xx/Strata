@@ -9,6 +9,11 @@
 
 #include <cstdint>
 
+#if defined(STRATA_HIP_WAVE64) && (defined(__gfx906__) || defined(__gfx908__))
+// A wave64 device pass (gfx906 / gfx908) of a wave64 build: the gfx10+ lane moves (DPP row_xmask, permlanex16) do not
+// exist there, so code that has a shuffle form of the same move takes it (`!defined(STRATA_WAVE64_DEVICE_PASS)`).
+#define STRATA_WAVE64_DEVICE_PASS 1
+#endif
 #if defined(STRATA_HIP_WAVE64) && defined(__gfx906__)
 // The gfx906 device pass of a mixed wave64 build: kernel bodies take the STRATA_HIP_GFX906 build's in-thread gfx906 code
 // (`#if defined(STRATA_HIP_GFX906) || defined(STRATA_GFX906_DEVICE_PASS)`) where it leaves the launch shape alone.

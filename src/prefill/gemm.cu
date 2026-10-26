@@ -278,6 +278,15 @@ std::unique_ptr<HipLtState> create_hipblaslt_state(void* workspace, size_t works
         from_package = true;                                          // the file is found below, once the card and the version are known
     }
 
+#if defined(STRATA_HIP_WAVE64)
+    {   // hipBLASLt ships no gfx906 kernels: no handle on that card (a split's other card keeps its table)
+        int d = 0;
+        hipDeviceProp_t p{};
+        if (hipGetDevice(&d) == hipSuccess && hipGetDeviceProperties(&p, d) == hipSuccess &&
+            std::strncmp(p.gcnArchName, "gfx906", 6) == 0)
+            return nullptr;
+    }
+#endif
     auto state = std::make_unique<HipLtState>();
     state->workspace = workspace;
     state->workspace_bytes = workspace_bytes;
