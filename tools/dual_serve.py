@@ -20,6 +20,8 @@ ap.add_argument("--gpu-a", default="0", help="HIP device of instance A, which pi
 ap.add_argument("--gpu-b", default="1", help="HIP device of instance B, which only locks it")
 ap.add_argument("--port-a", type=int, default=8080)
 ap.add_argument("--port-b", type=int, default=8081)
+ap.add_argument("--proxy-port", type=int, default=8090, help="one endpoint for both servers (tools/dual_proxy.py); 0 = none")
+ap.add_argument("--sticky", action="store_true", help="the proxy never moves a conversation to the other server")
 ap.add_argument("--kv", default=None, help="fp16|int8|q4_0|k8v4 for both (default: the config's)")
 ap.add_argument("--reserve-b", default="1500", help="--vram-reserve-mib of instance B (a 32 GB gfx906 card)")
 ap.add_argument("--ring", default="512", help="STRATA_PREFILL_RING for both")
@@ -114,9 +116,19 @@ signal.signal(signal.SIGINT, stop)
 signal.signal(signal.SIGTERM, stop)
 start("A", a.gpu_a, a.port_a, False)     # first: it fills the arena and pins it
 start("B", a.gpu_b, a.port_b, True)      # second: maps the filled arena, locked but not pinned
-print(f"\nboth servers are up.  Claude Code, one terminal per instance:\n"
-      f"  ANTHROPIC_BASE_URL=http://127.0.0.1:{a.port_a} ANTHROPIC_AUTH_TOKEN=x ANTHROPIC_MODEL=claude-sonnet-4-5 claude\n"
-      f"  ANTHROPIC_BASE_URL=http://127.0.0.1:{a.port_b} ANTHROPIC_AUTH_TOKEN=x ANTHROPIC_MODEL=claude-sonnet-4-5 claude\n"
-      "Ctrl+C stops both.", flush=True)
+if a.proxy_port:                         # one endpoint: new conversations go to the idle server (A, the faster reader, first)
+    pp = subprocess.Popen([sys.executable, str(ROOT / "tools" / "dual_proxy.py"), "--listen-port", str(a.proxy_port),
+                           "--backend", f"127.0.0.1:{a.port_a}:2", "--backend", f"127.0.0.1:{a.port_b}:1",
+                           *(["--sticky"] if a.sticky else [])], cwd=str(ROOT), start_new_session=True,
+                          stdout=open(ROOT / "strata-dual-proxy.log", "w"), stderr=subprocess.STDOUT)
+    procs.append(pp)
+    time.sleep(1.5)
+    if pp.poll() is not None:
+        stop()
+    print(f"proxy:      http://127.0.0.1:{a.proxy_port}  -> A (weight 2), B (weight 1);  status: /_proxy/status", flush=True)
+ep = a.proxy_port or a.port_a
+print(f"\nboth servers are up.  Claude Code on the one endpoint (parallel subagents use both GPUs):\n"
+      f"  ANTHROPIC_BASE_URL=http://127.0.0.1:{ep} ANTHROPIC_AUTH_TOKEN=x ANTHROPIC_MODEL=claude-sonnet-4-5 claude\n"
+      f"or one instance each (ports {a.port_a} and {a.port_b}).  Ctrl+C stops everything.", flush=True)
 while True:
     time.sleep(3600)
