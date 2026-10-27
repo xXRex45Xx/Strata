@@ -2455,30 +2455,6 @@ int main(int argc, char** argv) {
 #endif
         break;
     }
-#if defined(STRATA_HIP_WAVE64) && !defined(_WIN32)
-    // A mixed wave64 build (gfx906;gfx1200) on a layer split: 6 hardware queues per device, unless GPU_MAX_HW_QUEUES is
-    // set.  With ROCm's default 4, a pipelined split (--pipeline-windows 2, the split's default) whose FIRST stage is the
-    // RX 9060 XT and computes some experts on the CPU hung in every run: "no progress for 60 s ... verify window
-    // (pipelined): the CPU experts of layer 23", the engine restarted by the server again and again.  The stage's
-    // streams then share hardware queues, and a kernel spinning on a host flag holds up the work that raises it.
-    // MI60 + 9060 XT, Flash-Next Q2_0, three decodes of 256 tokens each, tok/s:
-    //   queues   auto split (all experts resident)   --layer-split 28 (CPU experts on the 9060 XT)
-    //   4        55.8 / 56.2 / 56.5                  hangs
-    //   5        45.8 / 46.1 / 46.0                  53.7 / 52.1 / 52.8
-    //   6        53.6 / 56.3 / 56.4                  52.8 / 52.2 / 53.0
-    //   8        45.4 / 45.5 / 45.5                  49.9 / 54.1 / 53.6
-    // (--pipeline-windows 0 at --layer-split 28: 39-44.)  Read by the runtime when it starts, so set here, before the
-    // first HIP call.  Not checked on a split of two wave32 cards.
-    for (int i = 1; i < argc; ++i) {
-        if (std::strcmp(argv[i], "--layer-split") != 0) continue;
-        if (std::getenv("GPU_MAX_HW_QUEUES") == nullptr) {
-            setenv("GPU_MAX_HW_QUEUES", "6", 0);
-            std::fprintf(stderr, "strata generate: layer split: GPU_MAX_HW_QUEUES=6 (6 hardware queues per GPU; a pipelined "
-                                 "split with the CPU's experts on its first card stalled with ROCm's 4)\n");
-        }
-        break;
-    }
-#endif
 #if defined(STRATA_HAVE_QWEN35)
     // **THE FAMILY SWITCH.**  A Qwen3.6-35B-A3B file (GGUF architecture qwen35moe) runs on its own engine path
     // (src/qwen35), decided here from the file's header before any of this engine's state exists; every other file
@@ -4349,6 +4325,19 @@ int main(int argc, char** argv) {
         bool on = o.serve && multi_gpu && !split_same && split_devs.size() + 1 >= min_st && !(ae != nullptr && std::atoi(ae) == 0);
 #if defined(STRATA_USE_HIP)
         on = on && decode_defaults_arch_ok();
+#if defined(STRATA_HIP_WAVE64)
+        // A mixed wave64 build (gfx906;gfx1200) with a wave64 card in the split's process: not by default.  MI60 + RX 9060 XT, Flash-Next Q2_0, auto split, three
+        // decodes of 256 tokens and two 3,200-token prompts per start: off 57.2-57.7 tok/s and 562 tok/s (K=15: the
+        // pipeline's VRAM goes to experts), on 56.0-56.5 and 541 (K=13).  And on, a split whose first stage (the 9060 XT)
+        // computes some experts on the CPU stalls with ROCm's 4 hardware queues ("no progress for 60 s ... verify window
+        // (pipelined): the CPU experts of layer 23"); GPU_MAX_HW_QUEUES=6 ends that, but makes about half of the starts
+        // 18% slower (the queues' placement on the card's pipes).  --pipeline-windows 2 still asks for it.
+        if (on && strata_hip_any_wave64()) {
+            on = false;
+            std::fprintf(stderr, "strata generate: --pipeline-windows stays off on this wave64 build's layer split (measured "
+                                 "faster off on an MI60 + 9060 XT; --pipeline-windows 2 asks for it)\n");
+        }
+#endif
 #else
         on = false;
 #endif
