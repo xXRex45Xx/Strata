@@ -21,7 +21,8 @@ ap.add_argument("--gpu-b", default="1", help="HIP device of instance B, which on
 ap.add_argument("--port-a", type=int, default=8080)
 ap.add_argument("--port-b", type=int, default=8081)
 ap.add_argument("--proxy-port", type=int, default=8090, help="one endpoint for both servers (tools/dual_proxy.py); 0 = none")
-ap.add_argument("--sticky", action="store_true", help="the proxy never moves a conversation to the other server")
+ap.add_argument("--non-sticky", action="store_true",
+                help="the proxy moves a conversation to the idle server when its own is busy (default: it waits)")
 ap.add_argument("--kv", default=None, help="fp16|int8|q4_0|k8v4 for both (default: the config's)")
 ap.add_argument("--reserve-b", default="1500", help="--vram-reserve-mib of instance B (a 32 GB gfx906 card)")
 ap.add_argument("--ring", default="512", help="STRATA_PREFILL_RING for both")
@@ -119,7 +120,7 @@ start("B", a.gpu_b, a.port_b, True)      # second: maps the filled arena, locked
 if a.proxy_port:                         # one endpoint: new conversations go to the idle server (A, the faster reader, first)
     pp = subprocess.Popen([sys.executable, str(ROOT / "tools" / "dual_proxy.py"), "--listen-port", str(a.proxy_port),
                            "--backend", f"127.0.0.1:{a.port_a}:2", "--backend", f"127.0.0.1:{a.port_b}:1",
-                           *(["--sticky"] if a.sticky else [])], cwd=str(ROOT), start_new_session=True,
+                           *(["--non-sticky"] if a.non_sticky else [])], cwd=str(ROOT), start_new_session=True,
                           stdout=open(ROOT / "strata-dual-proxy.log", "w"), stderr=subprocess.STDOUT)
     procs.append(pp)
     time.sleep(1.5)

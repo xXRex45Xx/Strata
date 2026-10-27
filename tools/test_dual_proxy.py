@@ -96,7 +96,8 @@ class ProxyTest(unittest.TestCase):
         self.assertEqual(chat(self.port, "two")["port"], self.pb)
         self.assertEqual(chat(self.port, "one")["port"], self.pa)
 
-    def test_busy_server_hands_the_conversation_to_an_idle_one(self):
+    def test_non_sticky_hands_a_busy_conversation_to_an_idle_server(self):
+        self.router.sticky = False
         chat(self.port, "mine")                       # mine -> a
         res = [None, None]
         t = threading.Thread(target=chat, args=(self.port, "other", res, 0))   # other -> a (tie), a is now busy
@@ -107,8 +108,8 @@ class ProxyTest(unittest.TestCase):
         self.assertEqual(res[0]["port"], self.pa)
         self.assertEqual(res[1]["port"], self.pb)
 
-    def test_sticky_waits_for_its_own_server(self):
-        self.router.sticky = True
+    def test_default_waits_for_its_own_server(self):
+        self.assertTrue(self.router.sticky)
         chat(self.port, "mine")
         t = threading.Thread(target=chat, args=(self.port, "other"))
         t.start()

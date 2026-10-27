@@ -5,10 +5,10 @@
 
 Point the client (ANTHROPIC_BASE_URL / an OpenAI base URL) at the proxy.  A request that starts a new conversation goes
 to the backend with the least work for its weight (active requests / weight; the first listed wins a tie).  A conversation
-that was seen before goes back to the backend that served it, because that server keeps its prompt in a conversation
-cache: another server would read the whole prompt again.  If that backend is busy and another one is idle the request
-moves to the idle one (--sticky never moves it: the request waits in the busy server's queue).  A backend that refuses a
-connection is skipped for 10 s.  Responses are passed through as they arrive, so streaming works.
+that was seen before always goes back to the backend that served it and waits there if it is busy, because that server
+keeps the conversation's prompt in its cache: another server would read the whole prompt again, which takes longer than
+the wait on a long conversation.  --non-sticky lets a request move to an idle backend instead.  A backend that refuses
+a connection is skipped for 10 s.  Responses are passed through as they arrive, so streaming works.
 GET /_proxy/status shows the load.  Only the standard library is used.
 """
 import argparse, hashlib, http.client, json, sys, threading, time
@@ -38,7 +38,7 @@ class Backend:
 
 
 class Router:
-    def __init__(self, backends: list, sticky: bool = False, map_size: int = 4096):
+    def __init__(self, backends: list, sticky: bool = True, map_size: int = 4096):
         self.backends, self.sticky, self.map_size = backends, sticky, map_size
         self.lock = threading.Lock()
         self.conv = OrderedDict()            # conversation key -> Backend, least recently used first
@@ -198,12 +198,13 @@ def main() -> None:
     ap.add_argument("--backend", action="append", required=True, metavar="HOST:PORT[:WEIGHT]")
     ap.add_argument("--host", default="127.0.0.1")
     ap.add_argument("--listen-port", type=int, default=8090)
-    ap.add_argument("--sticky", action="store_true", help="a conversation always waits for its own backend")
+    ap.add_argument("--non-sticky", action="store_true",
+                    help="a conversation whose backend is busy moves to an idle one (its prompt is read again there)")
     ap.add_argument("--map-size", type=int, default=4096, help="conversations remembered")
     ap.add_argument("--read-timeout", type=float, default=1800.0, help="seconds a backend may stay silent")
     ap.add_argument("--verbose", action="store_true")
     a = ap.parse_args()
-    router = Router([Backend(s) for s in a.backend], a.sticky, a.map_size)
+    router = Router([Backend(s) for s in a.backend], not a.non_sticky, a.map_size)
     srv = serve(router, a.host, a.listen_port, a.read_timeout, a.verbose)
     print(f"proxy: http://{a.host}:{a.listen_port} -> " + ", ".join(f"{b.name} (weight {b.weight:g})" for b in router.backends),
           flush=True)
