@@ -3488,7 +3488,11 @@ GFX1103_OPT_IN = os.environ.get("STRATA_EXPERIMENTAL_GFX1103") == "1"
 # build one with `STRATA_HIP_ARCHS=gfx1150 tools\hip\build_windows.bat` and start setup with `--prebuilt dist\`.
 # Unset: unchanged.
 GFX1150_OPT_IN = os.environ.get("STRATA_EXPERIMENTAL_GFX1150") == "1"
-AMD_ARCHS = ("gfx1100", "gfx1101", "gfx1102", "gfx1200", "gfx1201", "gfx1030", "gfx1031", "gfx1151") \
+# Wave64 cards (Vega 20: the MI50 / MI60 / Radeon VII).  They are compiled into the same STRATA_ENABLE_HIP engine as the wave32
+# cards (cmake/hip_backend.cmake's STRATA_HIP_WAVE64: the gfx906 kernel variants are chosen per device at run time, docs/AMD_HIP.md).
+# AMD publishes no TheRock wheels for them, so they need a system ROCm (rocm_root).
+WAVE64_ARCHS = ("gfx906",)
+AMD_ARCHS = ("gfx1100", "gfx1101", "gfx1102", "gfx1200", "gfx1201", "gfx1030", "gfx1031", "gfx1151") + WAVE64_ARCHS \
             + (("gfx1103",) if GFX1103_OPT_IN else ()) + (("gfx1150",) if GFX1150_OPT_IN else ())
 # The exact (bit-identical) speed switches the engine turns on by default on gfx1151 (src/core/arch_defaults.cpp), less
 # STRATA_HCD_EXACT: that one copies the gfx1151 hipBLASLt table's solutions 1176 / 1177, and the gfx1103 table
@@ -3519,6 +3523,7 @@ AMD_NAMES = {"gfx1100": "AMD Radeon RX 7900 series (gfx1100)",   # when sysfs ha
              "gfx1030": "AMD Radeon RX 6800 / 6900 series (gfx1030)",
              "gfx1031": "AMD Radeon RX 6700 XT series (gfx1031)",
              "gfx1151": "AMD Radeon 8060S / 8050S / 8040S (Ryzen AI Max, Strix Halo, gfx1151)",
+             "gfx906": "AMD Instinct MI50 / MI60 / Radeon VII (Vega 20, gfx906)",
              # integrated Radeons of other Ryzen families: named so they are not taken for Strix Halo (not supported)
              "gfx1150": "AMD Radeon 890M / 880M (Ryzen AI 300, Strix Point, gfx1150)",
              "gfx1152": "AMD Radeon 860M / 840M (Ryzen AI 300, Krackan Point, gfx1152)",
@@ -3526,7 +3531,7 @@ AMD_NAMES = {"gfx1100": "AMD Radeon RX 7900 series (gfx1100)",   # when sysfs ha
 AMD_CARDS = ("the RX 7900 XT / XTX (gfx1100), RX 7800 XT / 7700 XT (gfx1101), RX 9060 XT (gfx1200) and "
              "RX 9070 / 9070 XT / Radeon AI PRO R9700 (gfx1201), and the RX 6800 / 6900 series (gfx1030) and RX 6700 XT "
              "(gfx1031, #524), and the RX 7600 / 7600 XT (gfx1102, one run reported, #942), all unvalidated, and the Ryzen AI Max \"Strix Halo\" APU (Radeon 8060S / 8050S / 8040S, "
-             "gfx1151: experimental, docs/STRIX_HALO.md)")
+             "gfx1151: experimental, docs/STRIX_HALO.md), and the Instinct MI50 / MI60 / Radeon VII (gfx906: experimental, a system ROCm, docs/AMD_HIP.md)")
 
 
 def rocm_index(arch):
@@ -4514,6 +4519,11 @@ def rocm_root(archs):
         else:                                          # #446: a runtime-only ROCm (no -dev packages): cmake would fail
             warn(f"the ROCm in {sysroot} has no HIP development files ({', '.join(missing)}): using AMD's wheels in "
                  ".venv instead (or install them, e.g. AMD's amdrocm-core-dev package for your ROCm and card)")
+    wave64 = [a for a in archs if a in WAVE64_ARCHS]
+    if wave64:                                         # no TheRock wheel carries Vega 20's libraries
+        fail(f"{', '.join(wave64)} needs a ROCm in {sysroot} (ROCM_PATH): AMD publishes no Python wheels for it",
+             f"install ROCm {ROCM_SYSTEM_MIN[0]} or newer with the HIP development files (hipcc, hipBLAS, rocBLAS built for gfx906), "
+             "then run this again; docs/AMD_HIP.md, \"gfx906 beside a wave32 card\"")
     indexes = list(dict.fromkeys(rocm_index(a) for a in archs))
     if len(indexes) > 1:                               # TheRock's wheels hold one GPU family's libraries
         fail(f"cards of two GPU families ({', '.join(archs)}) need a system ROCm 7 (in /opt/rocm): AMD's Python "
@@ -9732,7 +9742,8 @@ def main() -> int:
         if CONTROL:
             pass    # the app's engine is a package: the server picks its tuning/ table for the card when it starts (strata_control/hipblaslt_tuning.py)
         else:
-            table = hipblaslt_table(gpu["arch"], lib_dirs, meta.get("hipblaslt_version"), [eng / "tuning"])
+            lt_arch = next((x for x in gpu.get("archs") or [gpu["arch"]] if x not in WAVE64_ARCHS), None)
+            table = hipblaslt_table(lt_arch, lib_dirs, meta.get("hipblaslt_version"), [eng / "tuning"]) if lt_arch else None
             if table:
                 cfg["env"] = {"STRATA_HIPBLASLT_TUNING": str(table)}
         if GFX1103_OPT_IN and gfx_arch_is(gpu["arch"], "gfx1103") and not WIN:

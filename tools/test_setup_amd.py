@@ -6,6 +6,7 @@ which TheRock index each family installs from.  No GPU, no ROCm, no downloads.
 """
 from __future__ import annotations
 
+import os
 import sys
 import tempfile
 import unittest
@@ -65,12 +66,31 @@ class KfdDetection(unittest.TestCase):
         self.assertEqual(ok, ["gfx1101", "gfx1200", "gfx1201", "gfx1102", "gfx1100"])
         self.assertIn("gfx1036", setup.amd_problem(g[4]))
 
+    def test_gfx906_listed_and_needs_system_rocm(self):
+        fake_sysfs(self.root, [
+            (90006, 240, 134, "", 32 << 30),                      # an MI60: gfx9 target 90006, no product_name text
+            (120000, 64, 135, None, 16 << 30),
+        ])
+        g = setup.amd_gpus(str(self.root))
+        self.assertEqual([x["arch"] for x in g], ["gfx906", "gfx1200"])
+        self.assertEqual(g[0]["name"], setup.AMD_NAMES["gfx906"])
+        self.assertAlmostEqual(g[0]["vram_gb"], 32.0)
+        self.assertEqual([setup.amd_problem(x) for x in g], [None, None])
+        self.assertIn("gfx906", setup.WAVE64_ARCHS)
+        self.assertNotIn("gfx906", setup.ROCM_INDEXES)
+        with mock.patch.dict(os.environ, {"ROCM_PATH": str(self.root / "no-rocm")}), \
+                mock.patch.object(setup, "fail", side_effect=SystemExit) as fail:
+            with self.assertRaises(SystemExit):
+                setup.rocm_root(["gfx906", "gfx1200"])
+            self.assertIn("gfx906", fail.call_args[0][0])
+
     def test_no_kfd(self):
         self.assertEqual(setup.amd_gpus(str(self.root)), [])
 
     def test_rocm_index_per_family(self):
         for arch in setup.AMD_ARCHS:
-            self.assertIn(arch, setup.ROCM_INDEXES)
+            if arch not in setup.WAVE64_ARCHS:                    # Vega 20 has no TheRock wheel: a system ROCm only
+                self.assertIn(arch, setup.ROCM_INDEXES)
         self.assertTrue(setup.ROCM_INDEXES["gfx1101"].endswith("/gfx110X-dgpu/"))
         self.assertTrue(setup.ROCM_INDEXES["gfx1200"].endswith("/gfx120X-all/"))
         self.assertEqual(setup.ROCM_INDEXES["gfx1101"], setup.ROCM_INDEXES["gfx1100"])
