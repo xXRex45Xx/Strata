@@ -4601,6 +4601,13 @@ def hipblaslt_table(arch, lib_dirs, ver=None, extra_dirs=()):
     return None
 
 
+def hip_compile_flags(root: Path, bitcode: Path) -> str:
+    """CMAKE_HIP_FLAGS for the chosen ROCm.  Its headers come before a distro's older HIP headers (/usr/include/hip), which
+    clang would otherwise pick up beside a newer /opt/rocm."""
+    return f"-DCMAKE_HIP_FLAGS=--rocm-path={root} --rocm-device-lib-path={bitcode}" \
+        + (f" -isystem {root / 'include'}" if (root / "include").is_dir() else "")
+
+
 def build_engine_hip(gpu, llama, vision="none") -> Path:
     """Compile the HIP engine for this AMD GPU into engine/ (again only when its source changed: a `git pull`).
     gpu["archs"]: every architecture it needs code for (the cards of a layer split), else gpu["arch"].  vision "cpu"
@@ -4643,10 +4650,7 @@ def build_engine_hip(gpu, llama, vision="none") -> Path:
                  "-DSTRATA_PREFILL_MMQ=ON", "-DSTRATA_Q6K_EXPERTS=ON", "-DSTRATA_MMQ_KQUANTS=ON", "-DCMAKE_HIP_ARCHITECTURES=" + ";".join(archs),
                  f"-DCMAKE_HIP_COMPILER={root / 'llvm' / 'bin' / 'clang++'}", f"-DCMAKE_HIP_COMPILER_ROCM_ROOT={root}",
                  "-DCMAKE_PREFIX_PATH=" + ";".join([str(root), *libs]),
-                 f"-DCMAKE_HIP_FLAGS=--rocm-path={root} --rocm-device-lib-path={bitcode}"
-                 # the chosen ROCm's headers come before a distro's older HIP headers (/usr/include/hip), which clang would
-                 # otherwise pick up beside a newer /opt/rocm
-                 + (f" -isystem {root / 'include'}" if (root / "include").is_dir() else ""),
+                 hip_compile_flags(root, bitcode),
                  f"-DSTRATA_GGML_DIR={llama}", *isa_floor_defs(floor, ROOT / "build-hip", meta)], None, "")
     if stale_binary(ROOT / "build-hip" / EXE):            # #2054: no stamp for a binary of another version
         fail(f"the engine build finished without a new engine ({EXE} is version "
@@ -4720,7 +4724,7 @@ def build_vision_hip(eng: Path, stamp: Path, meta: dict, llama, vsrc, archs: lis
                     [f"-DLLAMA_DIR={llama}", "-DSTRATA_VISION_HIP=ON", "-DSTRATA_VISION_HIP_ARCHS=" + ";".join(archs),
                      "-DSTRATA_PORTABLE=OFF", f"-DCMAKE_HIP_COMPILER={root / 'llvm' / 'bin' / 'clang++'}",
                      f"-DCMAKE_HIP_COMPILER_ROCM_ROOT={root}", "-DCMAKE_PREFIX_PATH=" + ";".join([str(root), *libs]),
-                     f"-DCMAKE_HIP_FLAGS=--rocm-path={root} --rocm-device-lib-path={bitcode}"], None, "")
+                     hip_compile_flags(root, bitcode)], None, "")
         shutil.copy2(ROOT / "build-vision-hip" / "bin" / HVEXE, eng / HVEXE)
     except SystemExit:
         raise
