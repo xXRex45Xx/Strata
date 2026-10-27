@@ -5,6 +5,7 @@
 #include "strata/core/geometry.hpp"
 #include "strata/kernels/kv_q8.hpp"
 #include "strata/kernels/kv_q4.hpp"
+#include "strata/kernels/gfx906_dispatch.hpp"
 #if defined(STRATA_HIP_GFX906)
 #include "strata/kernels/gfx_arch.hpp"
 #endif
@@ -1155,6 +1156,8 @@ void qsa_decode_attn_batch_rows(const float* q, const QsaAttnPoolsRows& rows, co
 #endif
 #if defined(STRATA_HIP_GFX906)
     per_row = true;
+#elif defined(STRATA_GFX906_KERNELS)
+    per_row = per_row || strata::kernels::on_gfx906();   // a mixed build's gfx906 card, as the gfx906 build
 #endif
     if (per_row) {
         for (int64_t r = 0; r < n_q; ++r)

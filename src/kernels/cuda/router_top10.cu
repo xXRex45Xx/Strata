@@ -52,6 +52,7 @@
 //     comparisons and that is the right trade here: n = 512, every comparison is independent, and the old
 //     version was O(k*n) with a serial `exp` inside.
 #include "strata/kernels/router_top10.hpp"
+#include "strata/kernels/gfx906_dispatch.hpp"
 
 #include <cuda_runtime.h>
 
@@ -187,7 +188,7 @@ __global__ void router_top10_kernel(const float* __restrict__ logits, int n_toke
 }
 
 
-#if defined(STRATA_HIP_GFX906)
+#if defined(STRATA_GFX906_KERNELS)
 // AMD (wave64): the same routing in ONE wavefront per token.  The block-wide kernel above spends its time in
 // barriers - 10 selection passes with two __syncthreads each over 8 logical warps - not in arithmetic (43 us per
 // token on gfx906).  Here every lane holds up to RW_PER probabilities in registers and each pass is a 64-lane
@@ -198,6 +199,7 @@ constexpr int RW_PER = 8;   // n_expert <= 64 * 8
 __global__ void __launch_bounds__(64) router_top10_wave_kernel(const float* __restrict__ logits, int n_tokens,
                                                                int n_expert, int k, int* __restrict__ ids,
                                                                float* __restrict__ weights) {
+#if STRATA_GFX906_BODY   // (a mixed build launches it on its gfx906 card only)
     __shared__ double s_ex[64 * RW_PER];
     __shared__ double s_sum;
     const int t = blockIdx.x;
@@ -260,8 +262,9 @@ __global__ void __launch_bounds__(64) router_top10_wave_kernel(const float* __re
         for (int i = 0; i < k; ++i)
             weights[(size_t) t * k + i] = (float) ((double) weights[(size_t) t * k + i] / sc);
     }
+#endif  // STRATA_GFX906_BODY
 }
-#endif  // STRATA_HIP_GFX906
+#endif  // STRATA_GFX906_KERNELS
 
 #if defined(__HIPCC__)
 // ---- S6, AMD: the same router, BIT-IDENTICAL, without its serial parts. Measured on RDNA4 (gfx1201) the kernel
@@ -427,6 +430,11 @@ void router_top10(const float* logits, int n_tokens, int n_expert, int k, int* i
         // gfx906 (wave64): the one-wavefront kernel below stays the default; the S6 kernel is wave32-shaped and only
         // runs here on request (STRATA_HIP_ROUTER_FAST=1) until it is measured on this card
         static const bool old = std::getenv("STRATA_HIP_ROUTER_FAST") == nullptr;
+#elif defined(STRATA_GFX906_KERNELS)
+        // a mixed wave64 build: the gfx906 card keeps the gfx906 build's choice above, the others this one
+        static const bool old_906 = std::getenv("STRATA_HIP_ROUTER_FAST") == nullptr;
+        static const bool old_other = std::getenv("STRATA_HIP_ROUTER_OLD") != nullptr;
+        const bool old = strata::kernels::on_gfx906() ? old_906 : old_other;
 #else
         static const bool old = std::getenv("STRATA_HIP_ROUTER_OLD") != nullptr;
 #endif
@@ -458,8 +466,8 @@ void router_top10(const float* logits, int n_tokens, int n_expert, int k, int* i
                      RT_MAX_THREADS * 64);
         std::exit(1);
     }
-#if defined(STRATA_HIP_GFX906)
-    if (n_expert <= 64 * RW_PER && !std::getenv("STRATA_ROUTER_BLOCK")) {
+#if defined(STRATA_GFX906_KERNELS)
+    if (n_expert <= 64 * RW_PER && !std::getenv("STRATA_ROUTER_BLOCK") && strata::kernels::on_gfx906()) {
         router_top10_wave_kernel<<<(unsigned) n_tokens, 64, 0, (cudaStream_t) stream>>>(logits, n_tokens, n_expert, k,
                                                                                        ids, weights);
         const cudaError_t e = cudaGetLastError();

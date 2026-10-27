@@ -1197,7 +1197,7 @@ __global__ void wait_flag_ge_kernel(const volatile uint32_t* flag, uint32_t valu
 // the GPU's clock in ns (the same sources as gpu_stamp_kernel)
 __device__ __forceinline__ unsigned long long strata_now_ns() {
     unsigned long long t;
-#if defined(STRATA_HIP_GFX906)
+#if defined(STRATA_HIP_GFX906) || defined(__gfx906__)   // (a mixed build's gfx906 pass too: its clock is 25 MHz)
     t = wall_clock64() * 40ull;
 #elif defined(__HIPCC__)
     t = wall_clock64() * 10ull;
@@ -1563,7 +1563,7 @@ __global__ void gpu_stamp_kernel(unsigned long long* buf, int i) {
         pdl_wait();
     }
     unsigned long long t;
-#if defined(STRATA_HIP_GFX906)
+#if defined(STRATA_HIP_GFX906) || defined(__gfx906__)
     t = wall_clock64() * 40ull;   // gfx906: the wall clock runs at 25 MHz (hipDeviceAttributeWallClockRate) -> ns
 #elif defined(__HIPCC__)
     t = wall_clock64() * 10ull;   // gfx10.3 / gfx11 / gfx12: a constant 100 MHz counter, in ns

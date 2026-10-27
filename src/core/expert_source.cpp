@@ -887,6 +887,8 @@ bool file_tier_unbuffered(const std::vector<std::string>& paths, uint64_t arena_
     bool old_rule = false;
 #if defined(STRATA_HIP_GFX906)
     old_rule = true;
+#elif defined(STRATA_HIP_WAVE64)
+    old_rule = strata_hip_any_wave64();   // a mixed wave64 build: when a gfx906 / gfx908 card is in the process
 #endif
     if (const char* r = std::getenv("STRATA_FILE_CACHE_OLD_RULE"); r != nullptr && r[0] != '\0') old_rule = r[0] != '0';
     const bool keepable = old_rule

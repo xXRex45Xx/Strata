@@ -1,5 +1,6 @@
 // src/kernels/cuda/fused_gr.cu - see include/strata/kernels/fused_gr.hpp.
 #include "strata/core/emulate.hpp"
+#include "strata/kernels/gfx906_dispatch.hpp"
 #include "strata/core/sm75_series.hpp"
 #include "strata/core/sm120_series.hpp"
 #include "strata/kernels/q8_1_finite.hpp"   // #606: q8_1_ds
@@ -30,11 +31,19 @@ constexpr int N = 2560;         // n_embd
 constexpr int HC = 4;           // streams
 constexpr int D = N * HC;       // 10240
 constexpr int LR = 320;         // hc_lr
-// the latency-hidden norm/up (gr_norm_fast_kernel / gr_up_fast_kernel, STRATA_GR_FAST): gfx906's, built for CUDA too
-#if defined(STRATA_HIP_GFX906) || !defined(__HIPCC__)
+// the latency-hidden norm/up (gr_norm_fast_kernel / gr_up_fast_kernel, STRATA_GR_FAST): gfx906's, built for CUDA too, and
+// for a mixed wave64 HIP build (gfx906;gfx1200), whose gfx906 card takes it (gr_fast())
+#if defined(STRATA_HIP_GFX906) || !defined(__HIPCC__) || defined(STRATA_GFX906_KERNELS)
 #define STRATA_GR_FAST_BUILD 1
 #else
 #define STRATA_GR_FAST_BUILD 0
+#endif
+// the wave32 HIP read's own kernels (the q8_1-fused up): every HIP build but the gfx906 one; a mixed build takes them on
+// its wave32 cards only (!on_gfx906())
+#if defined(__HIPCC__) && !defined(STRATA_HIP_GFX906)
+#define STRATA_GR_HIP32 1
+#else
+#define STRATA_GR_HIP32 0
 #endif
 static_assert(N == strata::core::kCompiledGeometry.n_embd && HC == strata::core::kCompiledGeometry.hc && LR == strata::core::kCompiledGeometry.hc_lr, "fused_gr is compiled for core/geometry.hpp");
 constexpr int THREADS = 256;
@@ -1079,6 +1088,8 @@ int down_chunk(bool staged, int* tile_out) {
 #if defined(__HIPCC__)
 #if defined(STRATA_HIP_GFX906)
         const bool small_tile = false;  // gfx906: 64 KiB LDS, the 2560 tile as before (8 tokens slice into launches)
+#elif defined(STRATA_GFX906_KERNELS)
+        const bool small_tile = !strata::kernels::on_gfx906_device(dev);   // a mixed build: as the gfx906 build on that card
 #else
         const bool small_tile = true;   // all eight tokens fit gfx1100's 64 KiB LDS at this tile
 #endif
@@ -1321,8 +1332,8 @@ void launch_multi(const GrMulti& m, int variant, cudaStream_t st, unsigned long 
     if (fast && !q8w) gr_up_fast_kernel<<<UPM_BLOCKS, THREADS, 0, st>>>(m);
     else
 #endif
-#if !STRATA_GR_FAST_BUILD
-    if (!q8w && m.a[0].q8_mixed != nullptr && qfuse_hc_local()) {
+#if STRATA_GR_HIP32
+    if (!q8w && m.a[0].q8_mixed != nullptr && !strata::kernels::on_gfx906() && qfuse_hc_local()) {
         switch (no_multi_gr ? kFusedGrMaxT : n_tok) {
             case 1: gr_up_q32_kernel<1, true><<<Q32_BLOCKS, Q32_THREADS, 0, st>>>(m); break;
             case 2: gr_up_q32_kernel<2, true><<<Q32_BLOCKS, Q32_THREADS, 0, st>>>(m); break;
@@ -2156,8 +2167,8 @@ template <int T> void launch_q8_t(const GrMulti& m, float* part, float* ssg, cud
     if (ts) gr_down_q8_fast_kernel<T, 4><<<dim3(LR / (WARPS * 4) + 1, Q8_NKC), THREADS, 0, st>>>(m, part, ssg);
     else gr_down_q8_kernel<T><<<dim3(Q8_RG + 1, Q8_NKC), THREADS, 0, st>>>(m, part, ssg);
     if (stamp_buf) gpu_stamp(stamp_buf, stamp_i0 + 1, (void*) st);
-#if !STRATA_GR_FAST_BUILD
-    if (m.a[0].q8_mixed != nullptr && qfuse_hc_local()) {   // HIP (not gfx906): the block owns a q8_1 group
+#if STRATA_GR_HIP32
+    if (m.a[0].q8_mixed != nullptr && !strata::kernels::on_gfx906() && qfuse_hc_local()) {   // HIP (not gfx906): the block owns a q8_1 group
         gr_up_q8_q32_kernel<T><<<Q32_BLOCKS, Q32_THREADS, 0, st>>>(m, part, ssg);
         return;
     }
@@ -2188,8 +2199,10 @@ static bool gr_fast() {
     static const int env = [] { const char* v = std::getenv("STRATA_GR_FAST"); return v ? (std::atoi(v) != 0 ? 1 : 0) : -1; }();
     if (g_gr_fast >= 0) return g_gr_fast != 0;
     if (env >= 0) return env != 0;
-#if defined(__HIPCC__)
+#if defined(STRATA_HIP_GFX906)
     return true;
+#elif defined(__HIPCC__)
+    return strata::kernels::on_gfx906();   // a mixed wave64 build: the gfx906 card (the wave32 ones keep their read)
 #else
     { const char* v = std::getenv("STRATA_SM70_TABLE"); return cur_dev_volta() && v != nullptr && std::atoi(v) != 0; }   // PR 1401: opt-in   // CUDA: on Volta (V100-SXM2: 50.9 -> 46.7 us a read at T 1, bitwise); elsewhere opt-in
 #endif

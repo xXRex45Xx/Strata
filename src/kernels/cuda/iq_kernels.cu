@@ -8,6 +8,7 @@
 #include "strata/core/sm75_series.hpp"
 #include "strata/core/sm120_series.hpp"
 #include "strata/kernels/gfx_arch.hpp"
+#include "strata/kernels/gfx906_dispatch.hpp"
 #include "strata/kernels/dp4a.hpp"
 #include "strata/kernels/q8_1_finite.hpp"
 #include "s26_tsum.cuh"
@@ -4369,6 +4370,11 @@ size_t native_expert_scratch_bytes(int64_t cap, int64_t n_ff) {
 constexpr int kExpModeDefault = 7;
 constexpr int kExpFallback = 2;   // modes 5-8 on a format without an LDS kernel: R2
 constexpr bool kExpLds16 = false; // IQ2_XXS gate/up: R2 as measured on gfx906
+#elif defined(STRATA_GFX906_KERNELS)
+// a mixed wave64 build: the gfx906 values on the gfx906 card, the others elsewhere (chosen per call, on_gfx906())
+#define kExpModeDefault (strata::kernels::on_gfx906() ? 7 : 0)
+#define kExpFallback (strata::kernels::on_gfx906() ? 2 : 0)
+#define kExpLds16 (!strata::kernels::on_gfx906())
 #else
 constexpr int kExpModeDefault = 0;
 constexpr int kExpFallback = 0;   // ... the CUDA layout (V100, IQ2_XXS gate/up: R2 183 us vs 113)
@@ -4976,6 +4982,9 @@ int exp_mode() {
 #if defined(STRATA_HIP_GFX906)
     return kExpModeDefault;
 #else
+#if defined(STRATA_GFX906_KERNELS)
+    if (strata::kernels::on_gfx906()) return 7;   // the gfx906 build's default, on that card of a mixed build
+#endif
     // Volta (sm_70): mode 8, the grid and the group's activations in shared memory with SwiGLU + q8_1 fused
     // (V100-SXM2, a verify window's VRAM call: 227 -> 159 us); every other CUDA card keeps the CUDA layout
     static int per_dev[64];   // 0 unknown, else mode + 1
@@ -5148,7 +5157,8 @@ void native_expert_grouped(const NativeExpertLayout& L, const unsigned long long
 #else
     // CUDA: the AMD layouts launch a block row per possible group, so a call that strides (a verify window's PCIe
     // call, grid_groups 1..cap) keeps the CUDA layout: V100, 0 groups 11.3 vs 6.5 us, 1 group of 2 29.6 vs 21.3
-    const int em0 = (grid_groups > 0 && grid_groups < cap_groups) ? 0 : exp_mode();
+    // (a mixed wave64 build: the gfx906 card keeps its own layout, as in the gfx906 build)
+    const int em0 = (grid_groups > 0 && grid_groups < cap_groups && !strata::kernels::on_gfx906()) ? 0 : exp_mode();
 #endif
 #endif
 #if STRATA_EXP_LAYOUTS
@@ -5235,6 +5245,9 @@ void native_expert_grouped(const NativeExpertLayout& L, const unsigned long long
     // kernel (bitwise the same) with STRATA_HIP_SWIGLU_FUSED=1
     static const bool sw_fused = env_on("STRATA_HIP_SWIGLU_FUSED");
     const bool sw_v1 = v1 || !sw_fused;
+#elif defined(STRATA_GFX906_KERNELS)
+    static const bool sw_fused = env_on("STRATA_HIP_SWIGLU_FUSED");   // the gfx906 card of a mixed build, as above
+    const bool sw_v1 = v1 || (strata::kernels::on_gfx906() && !sw_fused);
 #else
     const bool sw_v1 = v1;
 #endif

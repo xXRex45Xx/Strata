@@ -28,6 +28,7 @@
 #include "strata/kernels/q8_1_finite.hpp"
 #include "strata/kernels/iq_kernels.hpp"
 #include "strata/kernels/gfx_arch.hpp"
+#include "strata/kernels/gfx906_dispatch.hpp"
 #include "strata/core/sm75_series.hpp"
 #include "s26_tsum.cuh"
 #if !defined(__HIPCC__)
@@ -451,7 +452,7 @@ __device__ __align__(4) int8_t iq4nl_values[16] = {
 };
 
 __device__ __forceinline__ int2 iq4_table_lookup(int q4) {
-#if defined(STRATA_HIP_GFX906)
+#if defined(STRATA_HIP_GFX906) || defined(STRATA_GFX906_DEVICE_PASS)
     // AMD: llama.cpp's HIP lookup (see iq_kernels.cu get_int_from_table_16): 4 v_perm_b32 per 8 values
     const uint32_t* v32 = reinterpret_cast<const uint32_t*>(iq4nl_values);
     const uint32_t q_even = (uint32_t) q4, q_odd = (uint32_t) q4 >> 4;
@@ -1815,12 +1816,14 @@ void launch_check() {
 }
 
 
-#if defined(STRATA_HIP_GFX906)
+#if defined(STRATA_GFX906_KERNELS)
 // ---- AMD (wave64) layout: one wavefront per R rows, four wavefronts per block, the row's blocks strided over the
 // 64 lanes exactly as the CUDA kernels stride them over a block (kbx = lane / T, stride 64 / T), and a 64-lane
 // butterfly instead of the LDS partials and __syncthreads of the one-block-per-row layout: on gfx906 a block per
 // 2 KB row spent most of its time being launched and joined.  The SAME kernel serves every column count 1..8, so a
 // column's sums do not depend on how many columns (verify tokens) ride along.  STRATA_MMVQ_WAVE=0: the CUDA layout.
+// A mixed wave64 build (gfx906;gfx1200) launches it on the gfx906 card only (on_gfx906()); the other passes compile
+// it empty.
 bool g_wave_off = std::getenv("STRATA_MMVQ_WAVE") && std::string(std::getenv("STRATA_MMVQ_WAVE")) == "0";
 template<typename F, int NCOLS, int R>
 __launch_bounds__(256)
@@ -1828,6 +1831,7 @@ __global__ void native_mmvq_wave_kernel(const typename F::Block* __restrict__ w,
                                         float* __restrict__ y, int n_in, int n_out) {
     constexpr int BPIW = 64 / F::T;
     static_assert(64 % F::T == 0, "a block's threads must tile the wavefront");
+#if STRATA_GFX906_BODY
     const int lane = int(threadIdx.x) & 63;
     const int row0 = (int(blockIdx.x) * 4 + (int(threadIdx.x) >> 6)) * R;
     if (row0 >= n_out) return;
@@ -1855,6 +1859,7 @@ __global__ void native_mmvq_wave_kernel(const typename F::Block* __restrict__ w,
             for (int off = 32; off > 0; off >>= 1) v += __shfl_xor(v, off, 64);
             if (lane == 0 && row0 + i < n_out) y[std::size_t(j) * n_out + row0 + i] = v;
         }
+#endif  // STRATA_GFX906_BODY
 }
 template<typename F, int NCOLS>
 void wave_launch_n(const void* weights, const void* x_q8_1, float* y, int n_in, int n_out, cudaStream_t s) {
@@ -1880,7 +1885,7 @@ void wave_launch(const void* weights, const void* x_q8_1, float* y, int n_in, in
     }
 }
 #define STRATA_WAVE_MMVQ(...) \
-    if (!g_wave_off) { wave_launch<__VA_ARGS__>(weights, x_q8_1, y, n_in, n_out, ncols, stream); launch_check(); return; }
+    if (!g_wave_off && strata::kernels::on_gfx906()) { wave_launch<__VA_ARGS__>(weights, x_q8_1, y, n_in, n_out, ncols, stream); launch_check(); return; }
 #else
 #define STRATA_WAVE_MMVQ(...)
 #endif
