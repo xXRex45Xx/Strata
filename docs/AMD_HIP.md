@@ -552,6 +552,56 @@ In the config: `"args": [ ..., "--pipeline-windows", "2", "--trim-stage-weights"
 Not done on gfx906: setup detection and automatic build, Windows, images (`--vision`), MI60 and Radeon VII (same ISA, not run),
 a single-card run. Other measurements are under [History](#history--older-measurements).
 
+### gfx906 beside a wave32 card in one build (experimental)
+
+The wave32 backend (`STRATA_ENABLE_HIP`) can also take gfx906 (and gfx908) in its architecture list. One engine then runs an
+Instinct MI50 / MI60 or Radeon VII beside an RDNA card, alone or in one layer split. A CUDA warp is a logical 32-lane half of
+the 64-lane wavefront, as in the gfx906 build above. The gfx906 build's own kernels (one-wavefront MMVQ, mode-7 experts,
+the one-wavefront router) are compiled beside the wave32 ones and chosen per card at run time. A list without gfx906 or
+gfx908 builds exactly as before. Setup does not build it: build by hand.
+
+You need a rocBLAS with gfx906 kernels (ROCm 7 and later ship none), and the MMQ prompt kernels, which setup turns on for
+every HIP build:
+
+```sh
+cmake -S . -B build-hip -DCMAKE_BUILD_TYPE=Release -DSTRATA_ENABLE_HIP=ON -DSTRATA_ENABLE_CUDA=OFF \
+  "-DCMAKE_HIP_ARCHITECTURES=gfx906;gfx1200" \
+  -DSTRATA_PREFILL_MMQ=ON -DSTRATA_Q6K_EXPERTS=ON -DSTRATA_MMQ_KQUANTS=ON
+cmake --build build-hip --target strata -j8
+```
+
+Without `-DSTRATA_PREFILL_MMQ=ON` the MI60 reads prompts about 22% slower (350 against 450 tok/s on a 3,200-token prompt).
+
+> **Measured on:** Instinct MI60 32 GB (gfx906, PCIe 4.0 x4 through the chipset) and RX 9060 XT 16 GB (gfx1200), Ryzen 5
+> 9600X, 48 GB RAM, ROCm 10.1 with a rocBLAS rebuilt for gfx906. Flash-Next Q2_0, 32K context, `--spec 4`, MTP,
+> `--kv int8`. Each run: three decodes of 256 greedy tokens and two 3,200-token prompts, one start per row. One machine,
+> one model.
+
+| Engine, cards | Decode | Prompt |
+| --- | ---: | ---: |
+| gfx1200 build, 9060 XT | 63-66 tok/s | 1,248-1,296 tok/s |
+| `gfx906;gfx1200` build, 9060 XT | 61-66 tok/s | 1,249-1,302 tok/s |
+| `gfx906;gfx1200` build, MI60 | 63-67 tok/s | 450-452 tok/s |
+| gfx906 build (`STRATA_HIP_GFX906`), MI60 | 64-70 tok/s | 444 tok/s |
+| `gfx906;gfx1200` build, both cards, auto split | 57.2-57.3 tok/s | 466-561 tok/s |
+
+This model fits on either card alone, so the pair is not faster here. It holds every expert in VRAM, which matters for a
+larger model or a longer context.
+
+What differs on such a split:
+
+- **The split's speed per card is measured.** CUs x clock rated the MI60 2.6x faster than the 9060 XT per layer. The search
+  now times the decode GEMV on each card when the cards differ in architecture (27.5 and 36.3 us here).
+  `STRATA_SPLIT_SPEED_PROBE=0` keeps the formula.
+- **`--pipeline-windows` is off by default** (above: faster off). If you ask for `--pipeline-windows 2` and the first card
+  computes some experts on the CPU, add `"GPU_MAX_HW_QUEUES": "6"` to the config's `env`: with ROCm's 4 hardware queues
+  that split stalls ("no progress for 60 s ... the CPU experts of layer N").
+- **Host memory** the GPU maps is fine-grained (coherent) whenever a gfx906 card may read it, and `mlock`ed
+  (`STRATA_HIP_MLOCK=0` turns that off; raise `ulimit -l`).
+- hipBLASLt is never used on the gfx906 card.
+
+Not done: Windows, setup detection, a split of two wave32 cards with `--pipeline-windows 2` and 4 hardware queues.
+
 ## Tuning table
 
 A hipBLASLt table holds solution ids that are valid only for one GPU architecture and one hipBLASLt version, so it is calibrated
