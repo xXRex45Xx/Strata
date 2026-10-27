@@ -261,16 +261,20 @@ bool batch_self_commits(const int* rows, int S) { return g_batch_self_commit && 
 // gfx1030 (RX 6800, Windows, 42.5 -> 56.4 t/s).  STRATA_SH_STREAM overrides either default: `=1` forks, `=0` does not.
 // Strix Halo (gfx1151, unified memory) is the exception: the fork pays there (+1.8% UD-IQ4_XS, +6.7% UD-Q4_K_XL decode
 // at 8K, ids identical), so the gfx1151 arch table sets STRATA_SH_STREAM=1.  Read on first use, after that table ran.
+// A mixed wave64 build forks on its gfx906 card, as the gfx906 build does (it takes the CUDA default): MI60, Flash-Next
+// Q2_0, three decodes of 256 tokens, 60.1 / 64.4 / 61.8 tok/s without the fork against 63.4 / 67.5 / 64.5 with it.
+// The wave32 cards keep it off; that is decided per device when the window graph is recorded.
 bool sh_stream_on() {
-    static const bool on = [] {
-        if (const char* v = std::getenv("STRATA_SH_STREAM")) return v[0] != '0';
-#if defined(STRATA_USE_HIP)
-        return false;
-#else
-        return true;
-#endif
+    static const int env = [] {
+        if (const char* v = std::getenv("STRATA_SH_STREAM")) return v[0] != '0' ? 1 : 0;
+        return -1;
     }();
-    return on;
+    if (env >= 0) return env != 0;
+#if defined(STRATA_USE_HIP)
+    return strata::kernels::on_gfx906();   // (false in a wave32-only build)
+#else
+    return true;
+#endif
 }
 
 // 0.2.2: the zero-doorbell window graph has one host wait, the PLE flag (layer 1's wait kernel spins until the host has read

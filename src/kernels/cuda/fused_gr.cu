@@ -32,7 +32,7 @@ constexpr int HC = 4;           // streams
 constexpr int D = N * HC;       // 10240
 constexpr int LR = 320;         // hc_lr
 // the latency-hidden norm/up (gr_norm_fast_kernel / gr_up_fast_kernel, STRATA_GR_FAST): gfx906's, built for CUDA too, and
-// for a mixed wave64 HIP build (gfx906;gfx1200), whose gfx906 card takes it (gr_fast())
+// for a mixed wave64 HIP build (gfx906;gfx1200), where it is opt-in (gr_fast())
 #if defined(STRATA_HIP_GFX906) || !defined(__HIPCC__) || defined(STRATA_GFX906_KERNELS)
 #define STRATA_GR_FAST_BUILD 1
 #else
@@ -2202,7 +2202,9 @@ static bool gr_fast() {
 #if defined(STRATA_HIP_GFX906)
     return true;
 #elif defined(__HIPCC__)
-    return strata::kernels::on_gfx906();   // a mixed wave64 build: the gfx906 card (the wave32 ones keep their read)
+    // a mixed wave64 build: opt-in on every card.  Its gfx906 card keeps the HIP read with the q8_1-fused up, which the
+    // gfx906 build does not have: MI60, Flash-Next Q2_0, decode 52 tok/s with the fast read against 58 without
+    return false;
 #else
     { const char* v = std::getenv("STRATA_SM70_TABLE"); return cur_dev_volta() && v != nullptr && std::atoi(v) != 0; }   // PR 1401: opt-in   // CUDA: on Volta (V100-SXM2: 50.9 -> 46.7 us a read at T 1, bitwise); elsewhere opt-in
 #endif

@@ -43,6 +43,7 @@
 #include "strata/core/session.hpp"
 #include "strata/core/weights.hpp"
 #include "strata/kernels/gfx_arch.hpp"
+#include "strata/kernels/native_mmvq.hpp"
 #include "strata/kernels/cpu/expert.hpp"
 #include "strata/kernels/cpu/pool.hpp"
 #include "strata/platform/aux_cpus.hpp"
@@ -1994,6 +1995,63 @@ static bool pcie_auto_split_ok() {
     return false;
 #endif
 }
+
+#if defined(STRATA_USE_HIP)
+// The layer split's per-card decode speed, measured (HIP).  The search prices a stage by CUs x shader clock, which
+// ranks cards of one architecture well and cards of different ones badly: an Instinct MI60 (gfx906, 64 CUs at
+// 1.80 GHz) beside an RX 9060 XT (gfx1200, reported as 16 at 2.78 GHz) came out 2.6x faster per layer, so the auto
+// split gave it 36 of 48 layers - and measured alone on Flash-Next Q2_0 the MI60 decodes no faster than the 9060 XT.
+// This times the engine's own decode GEMV on the card instead: 16 Q2_0 matrices of 2560 x 4096 (47 MB, past either
+// card's L2) at 4 columns (a verify window), the best of 3 timed passes after a warm-up; microseconds per call, < 0
+// when it cannot run.  The weights are zeros: the kernel's time does not depend on their values.
+double probe_decode_gemv_us(int dev) {
+    const strata::core::OnDevice on(dev);
+    constexpr int kIn = 2560, kOut = 4096, kMats = 16, kCols = 4, kReps = 8;
+    const size_t mat = (size_t) (kIn / 64) * 18 * kOut;   // Q2_0: 18 bytes per 64 weights
+    const size_t xb = strata::kernels::native_q8_1_bytes(kIn, kCols);
+    void* w = nullptr;
+    void* x = nullptr;
+    float* y = nullptr;
+    cudaStream_t s = nullptr;
+    cudaEvent_t e0 = nullptr, e1 = nullptr;
+    double us = -1.0;
+    if (cudaMalloc(&w, mat * kMats) == cudaSuccess && cudaMalloc(&x, xb) == cudaSuccess &&
+        cudaMalloc((void**) &y, (size_t) kOut * kCols * sizeof(float)) == cudaSuccess &&
+        cudaMemset(w, 0, mat * kMats) == cudaSuccess && cudaMemset(x, 0, xb) == cudaSuccess &&
+        cudaStreamCreateWithFlags(&s, cudaStreamNonBlocking) == cudaSuccess && cudaEventCreate(&e0) == cudaSuccess &&
+        cudaEventCreate(&e1) == cudaSuccess) {
+        try {
+            auto pass = [&] {
+                for (int m = 0; m < kMats; ++m)
+                    strata::kernels::native_q2_0_mmvq((const char*) w + m * mat, x, y, kIn, kOut, kCols, s);
+            };
+            pass();
+            float best = -1.0f;
+            for (int r = 0; r < 3; ++r) {
+                float ms = 0.0f;
+                cudaEventRecord(e0, s);
+                for (int k = 0; k < kReps; ++k) pass();
+                cudaEventRecord(e1, s);
+                if (cudaEventSynchronize(e1) == cudaSuccess && cudaEventElapsedTime(&ms, e0, e1) == cudaSuccess &&
+                    (best < 0.0f || ms < best))
+                    best = ms;
+            }
+            if (best > 0.0f) us = 1000.0 * best / (kReps * kMats);
+        } catch (const std::exception&) {
+            us = -1.0;
+        }
+    }
+    if (s != nullptr) cudaStreamSynchronize(s);
+    if (e0 != nullptr) cudaEventDestroy(e0);
+    if (e1 != nullptr) cudaEventDestroy(e1);
+    if (s != nullptr) cudaStreamDestroy(s);
+    if (y != nullptr) cudaFree(y);
+    if (x != nullptr) cudaFree(x);
+    if (w != nullptr) cudaFree(w);
+    (void) cudaGetLastError();
+    return us;
+}
+#endif
 
 // The effective host->device bandwidth of the PCIe link: copies from pinned host memory, as the expert arena's
 // reads are.  The native default share (0.55) was measured on x16 links (~26-28 GB/s); a x8 card in a x8 slot
@@ -4606,6 +4664,49 @@ int main(int argc, char** argv) {
                                  "%.2f GiB free before its session carve\n", dev, sms, khz / 1e6, layer_ms[(size_t) i],
                          (double) cap[(size_t) i] / 1073741824.0);
         }
+#if defined(STRATA_USE_HIP)
+        // Cards of different architectures (probe_decode_gemv_us): the stages' per-layer times are shared out again by
+        // each card's measured decode GEMV, keeping their mean (the formula's scale against the miss cost, as fitted).
+        // STRATA_SPLIT_SPEED_PROBE=0 keeps the formula, =1 measures on any split; STRATA_SPLIT_SPEED_SCALE wins over both.
+        {
+            static const int probe_env = [] {
+                const char* v = std::getenv("STRATA_SPLIT_SPEED_PROBE");
+                return v != nullptr && *v ? (v[0] != '0' ? 1 : 0) : -1;
+            }();
+            const char* sc = std::getenv("STRATA_SPLIT_SPEED_SCALE");
+            bool mixed = false;
+            std::string arch0;
+            for (int i = 0; i < ns; ++i) {
+                const int dev = i == 0 ? 0 : stages[(size_t) i - 1]->dev;
+                cudaDeviceProp p{};
+                if (cudaGetDeviceProperties(&p, dev) != cudaSuccess) { (void) cudaGetLastError(); continue; }
+                std::string arch(p.gcnArchName);
+                if (const size_t colon = arch.find(':'); colon != std::string::npos) arch.resize(colon);
+                if (i == 0) arch0 = arch;
+                else if (arch != arch0) mixed = true;
+            }
+            if ((sc == nullptr || !*sc) && (probe_env == 1 || (probe_env != 0 && mixed))) {
+                std::vector<double> us((size_t) ns, -1.0);
+                bool ok = true;
+                for (int i = 0; i < ns && ok; ++i) {
+                    us[(size_t) i] = probe_decode_gemv_us(i == 0 ? 0 : stages[(size_t) i - 1]->dev);
+                    ok = us[(size_t) i] > 0.0;
+                }
+                if (ok) {
+                    double mean_ms = 0.0, mean_us = 0.0;
+                    for (int i = 0; i < ns; ++i) { mean_ms += layer_ms[(size_t) i]; mean_us += us[(size_t) i]; }
+                    for (int i = 0; i < ns; ++i) {
+                        layer_ms[(size_t) i] = mean_ms * us[(size_t) i] / mean_us;
+                        std::fprintf(stderr, "strata generate: layer split auto: CUDA%d decode GEMV %.1f us -> %.2f ms per layer "
+                                             "(measured; STRATA_SPLIT_SPEED_PROBE=0 keeps the formula)\n",
+                                     i == 0 ? 0 : stages[(size_t) i - 1]->dev, us[(size_t) i], layer_ms[(size_t) i]);
+                    }
+                } else {
+                    std::fprintf(stderr, "strata generate: layer split auto: the decode GEMV probe could not run; the formula stays\n");
+                }
+            }
+        }
+#endif
         // The per-stage link, measured here (the stage-setup probes are skipped when --pcie-frac is given, and the
         // search needs the reading either way).
         std::vector<double> link_gbps((size_t) ns, -1.0);
