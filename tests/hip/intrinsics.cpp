@@ -17,7 +17,11 @@
 
 namespace {
 
-constexpr int kLanes = 32;
+constexpr int kLanes = 32;   // a CUDA warp
+// the lanes launched: one wavefront.  A wave64 build (STRATA_HIP_WAVE64) also runs on gfx906 / gfx908, where a CUDA
+// warp is a logical 32-lane half of the 64-lane wavefront: the test then launches both halves and checks that each
+// one shuffles, exchanges and ballots within itself.
+constexpr int kMaxLanes = 64;
 constexpr int kIntegerResults = 10;
 
 __global__ void intrinsic_probe(int* integer_results, float* float_shuffle, double* double_shuffle,
@@ -37,7 +41,7 @@ __global__ void intrinsic_probe(int* integer_results, float* float_shuffle, doub
         __dp4a(static_cast<int>(dot_inputs[lane * 2]), static_cast<int>(dot_inputs[lane * 2 + 1]),
                0x7fffffff - lane);
 
-    __shared__ int exchanged[kLanes];
+    __shared__ int exchanged[kMaxLanes];
     int sum = 0;
     for (int iteration = 0; iteration < 64; ++iteration) {
         exchanged[lane] = static_cast<int>(dot_inputs[lane * 2] & 255u) + iteration;
@@ -58,8 +62,8 @@ __global__ void intrinsic_probe(int* integer_results, float* float_shuffle, doub
     double_shuffle[lane] = __shfl_xor_sync(mask, static_cast<double>(lane) + 0.25, 1);
 
     const unsigned hit = __ballot_sync(mask, (lane & 1) == 0);
-    if (lane == 0) {
-        *ballot = hit;
+    if ((lane & (kLanes - 1)) == 0) {   // each warp's first lane
+        ballot[lane / kLanes] = hit;
         __nanosleep(100);
     }
 }
@@ -130,41 +134,49 @@ int main() {
     CHECK(hipGetDevice(&device));
     hipDeviceProp_t properties{};
     CHECK(hipGetDeviceProperties(&properties, device));
+#if defined(STRATA_HIP_WAVE64)
+    if (properties.warpSize != 32 && properties.warpSize != 64) {
+        std::fprintf(stderr, "expected wave32 or wave64, got wave%d\n", properties.warpSize);
+        return 1;
+    }
+#else
     if (properties.warpSize != kLanes) {
         std::fprintf(stderr, "expected wave32, got wave%d\n", properties.warpSize);
         return 1;
     }
+#endif
+    const int lanes = properties.warpSize;   // one wavefront: one CUDA warp, or two on wave64
 
     int* device_integers = nullptr;
     float* device_float_shuffle = nullptr;
     double* device_double_shuffle = nullptr;
     unsigned* device_ballot = nullptr;
     uint32_t* device_dot_inputs = nullptr;
-    CHECK(hipMalloc(reinterpret_cast<void**>(&device_integers), kLanes * kIntegerResults * sizeof(int)));
-    CHECK(hipMalloc(reinterpret_cast<void**>(&device_float_shuffle), kLanes * 4 * sizeof(float)));
-    CHECK(hipMalloc(reinterpret_cast<void**>(&device_double_shuffle), kLanes * sizeof(double)));
-    CHECK(hipMalloc(reinterpret_cast<void**>(&device_ballot), sizeof(unsigned)));
-    CHECK(hipMalloc(reinterpret_cast<void**>(&device_dot_inputs), kLanes * 2 * sizeof(uint32_t)));
+    CHECK(hipMalloc(reinterpret_cast<void**>(&device_integers), kMaxLanes * kIntegerResults * sizeof(int)));
+    CHECK(hipMalloc(reinterpret_cast<void**>(&device_float_shuffle), kMaxLanes * 4 * sizeof(float)));
+    CHECK(hipMalloc(reinterpret_cast<void**>(&device_double_shuffle), kMaxLanes * sizeof(double)));
+    CHECK(hipMalloc(reinterpret_cast<void**>(&device_ballot), 2 * sizeof(unsigned)));
+    CHECK(hipMalloc(reinterpret_cast<void**>(&device_dot_inputs), kMaxLanes * 2 * sizeof(uint32_t)));
 
-    uint32_t dot_inputs[kLanes * 2]{};
-    for (int lane = 0; lane < kLanes; ++lane) {
+    uint32_t dot_inputs[kMaxLanes * 2]{};
+    for (int lane = 0; lane < kMaxLanes; ++lane) {
         dot_inputs[lane * 2] = 0x80ff017fu ^ (0x01010101u * static_cast<uint32_t>(lane));
         dot_inputs[lane * 2 + 1] = 0x0203fe81u + (0x11111111u * static_cast<uint32_t>(lane));
     }
     CHECK(hipMemcpy(device_dot_inputs, dot_inputs, sizeof(dot_inputs), hipMemcpyHostToDevice));
 
-    hipLaunchKernelGGL(intrinsic_probe, dim3(1), dim3(kLanes), 0, 0,
+    hipLaunchKernelGGL(intrinsic_probe, dim3(1), dim3(lanes), 0, 0,
                        device_integers, device_float_shuffle, device_double_shuffle, device_ballot, device_dot_inputs);
     CHECK(hipDeviceSynchronize());
 
-    int integers[kLanes * kIntegerResults]{};
-    float float_shuffle[kLanes * 4]{};
-    double double_shuffle[kLanes]{};
-    unsigned ballot = 0;
+    int integers[kMaxLanes * kIntegerResults]{};
+    float float_shuffle[kMaxLanes * 4]{};
+    double double_shuffle[kMaxLanes]{};
+    unsigned ballot[2] = {};
     CHECK(hipMemcpy(integers, device_integers, sizeof(integers), hipMemcpyDeviceToHost));
     CHECK(hipMemcpy(float_shuffle, device_float_shuffle, sizeof(float_shuffle), hipMemcpyDeviceToHost));
     CHECK(hipMemcpy(double_shuffle, device_double_shuffle, sizeof(double_shuffle), hipMemcpyDeviceToHost));
-    CHECK(hipMemcpy(&ballot, device_ballot, sizeof(ballot), hipMemcpyDeviceToHost));
+    CHECK(hipMemcpy(ballot, device_ballot, sizeof(unsigned) * (lanes / kLanes), hipMemcpyDeviceToHost));
 
     constexpr uint32_t a = 0x80ff017fu, b = 0x0203fe81u;
     const uint32_t expected_integer[6] = {
@@ -175,8 +187,10 @@ int main() {
         signed_saturating_sub_reference(0x807f0080u, 0x017f0180u),
         not_equal_reference(0x00ff0102u, 0x01010103u),
     };
-    bool ok = ballot == 0x55555555u;
-    for (int lane = 0; lane < kLanes; ++lane) {
+    bool ok = true;
+    for (int w = 0; w < lanes / kLanes; ++w) ok = ok && ballot[w] == 0x55555555u;   // each warp's own 32 bits
+    for (int lane = 0; lane < lanes; ++lane) {
+        const int first = lane & ~(kLanes - 1);   // the lane's warp's first lane (32 on a wave64 card's upper half)
         for (int i = 0; i < 6; ++i)
             ok = ok && static_cast<uint32_t>(integers[lane * kIntegerResults + i]) == expected_integer[i];
         ok = ok && static_cast<uint32_t>(integers[lane * kIntegerResults + 6]) ==
@@ -191,8 +205,8 @@ int main() {
         ok = ok && float_shuffle[lane * 4 + 0] == static_cast<float>(lane ^ 1);
         const int down = lane % 8 < 4 ? lane + 4 : lane;
         ok = ok && float_shuffle[lane * 4 + 1] == static_cast<float>(down);
-        ok = ok && float_shuffle[lane * 4 + 2] == static_cast<float>(lane == 0 ? 0 : lane - 1);
-        ok = ok && float_shuffle[lane * 4 + 3] == 0.0f;
+        ok = ok && float_shuffle[lane * 4 + 2] == static_cast<float>(lane == first ? lane : lane - 1);
+        ok = ok && float_shuffle[lane * 4 + 3] == static_cast<float>(first);
         ok = ok && double_shuffle[lane] == static_cast<double>(lane ^ 1) + 0.25;
     }
 
