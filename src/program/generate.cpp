@@ -2002,8 +2002,10 @@ static bool pcie_auto_split_ok() {
 // 1.80 GHz) beside an RX 9060 XT (gfx1200, reported as 16 at 2.78 GHz) came out 2.6x faster per layer, so the auto
 // split gave it 36 of 48 layers - and measured alone on Flash-Next Q2_0 the MI60 decodes no faster than the 9060 XT.
 // This times the engine's own decode GEMV on the card instead: 16 Q2_0 matrices of 2560 x 4096 (47 MB, past either
-// card's L2) at 4 columns (a verify window), the best of 3 timed passes after a warm-up; microseconds per call, < 0
-// when it cannot run.  The weights are zeros: the kernel's time does not depend on their values.
+// card's L2) at 4 columns (a verify window), the best of 5 timed passes after a warm-up long enough (~4 timed passes)
+// to bring an idle card's clocks up - with one warm-up pass, the 9060 XT read 44.6 us in one start and 27.8 in
+// another; microseconds per call, < 0 when it cannot run.  The weights are zeros: the kernel's time does not depend on
+// their values.
 double probe_decode_gemv_us(int dev) {
     const strata::core::OnDevice on(dev);
     constexpr int kIn = 2560, kOut = 4096, kMats = 16, kCols = 4, kReps = 8;
@@ -2025,9 +2027,9 @@ double probe_decode_gemv_us(int dev) {
                 for (int m = 0; m < kMats; ++m)
                     strata::kernels::native_q2_0_mmvq((const char*) w + m * mat, x, y, kIn, kOut, kCols, s);
             };
-            pass();
+            for (int k = 0; k < 4 * kReps; ++k) pass();
             float best = -1.0f;
-            for (int r = 0; r < 3; ++r) {
+            for (int r = 0; r < 5; ++r) {
                 float ms = 0.0f;
                 cudaEventRecord(e0, s);
                 for (int k = 0; k < kReps; ++k) pass();
